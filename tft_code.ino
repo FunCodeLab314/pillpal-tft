@@ -1,5 +1,5 @@
 // ============================================================================
-//  PillPal ESP32-S3 - SCREEN FLOW & LOGGING UPDATE
+//  PillPal ESP32-S3 - FIXED VERSION
 // ============================================================================
 
 #include <lvgl.h>
@@ -12,16 +12,15 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h> 
 #include <ArduinoJson.h>
-#include "time.h"  // For Real Time
+#include "time.h"
 #include "ui.h"
 
 // ==================== CONFIGURATION ====================
 #define WIFI_SSID       "ESP32"
 #define WIFI_PASSWORD   "12345678"
 
-// Time Configuration (Philippines GMT+8)
 const char* ntpServer = "pool.ntp.org";
-const long  gmtOffset_sec = 28800; // GMT+8 = 8 * 3600
+const long  gmtOffset_sec = 28800;
 const int   daylightOffset_sec = 0;
 
 #define MQTT_SERVER     "690e24c4c0b347498798415094d4ebd6.s1.eu.hivemq.cloud" 
@@ -47,8 +46,8 @@ String currentMedication = "";
 volatile bool uiNeedsUpdate = false;
 volatile bool alarmActive = false;
 bool bleConnected = false;
+bool buttonConfigured = false;  // NEW: Track if button is configured
 
-// BLE Objects
 BLEClient* pBLEClient = NULL;
 BLERemoteCharacteristic* pCommandChar = NULL;
 BLERemoteCharacteristic* pStatusChar = NULL;
@@ -70,27 +69,21 @@ lv_indev_t *indev;
 
 // ==================== HELPER FUNCTIONS ====================
 
-// Log to Serial AND Screen 1
 void logStatus(String msg) {
-    Serial.println(msg); // Print to Serial Monitor
+    Serial.println(msg);
     
-    // Update Screen 1 Label
-    if (ui_uiserialLabel) {
+    if (ui_uiserialLabel && lv_scr_act() == ui_Screen1) {
         lv_label_set_text(ui_uiserialLabel, msg.c_str());
-        lv_refr_now(disp); // Force immediate refresh
+        lv_refr_now(disp);
     }
 }
 
-// Update Time on Screen 1
 void printLocalTime() {
     struct tm timeinfo;
     if(!getLocalTime(&timeinfo)){
-        // Only log this if we are on screen 1 to avoid spamming
-        if(lv_scr_act() == ui_Screen1) Serial.println("Failed to obtain time");
-        return;
+        return;  // Silently fail
     }
     
-    // Format: 12:00 am
     char timeStringBuff[50];
     strftime(timeStringBuff, sizeof(timeStringBuff), "%I:%M %p", &timeinfo);
     
@@ -189,28 +182,58 @@ void sendAlarmStop() {
 
 // ==================== UI BUTTON CALLBACK ====================
 
-// This function handles the Dispense Button on Screen 2
 void on_dispense_btn_event(lv_event_t * e) {
     lv_event_code_t code = lv_event_get_code(e);
     
-    if(code == LV_EVENT_CLICKED || code == LV_EVENT_SHORT_CLICKED) {
+    if(code == LV_EVENT_CLICKED) {
         Serial.println(">>> [UI] Dispense Button Clicked");
         
         // 1. Stop the buzzer
         sendAlarmStop();
-        delay(200); 
+        delay(100); 
         
         // 2. Send Dispense Command
         sendDispenseCommand(currentSlot);
 
-        // 3. Reset UI Labels (Optional cleanup)
-        if(ui_patientName) lv_label_set_text(ui_patientName, "---");
-        if(ui_medication) lv_label_set_text(ui_medication, "---");
-        if(ui_slot) lv_label_set_text(ui_slot, "---");
+        // 3. Small delay to ensure command is sent
+        delay(100);
         
         // 4. GO BACK TO SCREEN 1
         Serial.println(">>> [UI] Returning to Screen 1");
         lv_scr_load(ui_Screen1);
+        
+        // 5. Reset for next dispense
+        buttonConfigured = false;
+        
+        // 6. Update status on screen 1
+        logStatus("Dispense Complete | Ready");
+    }
+}
+
+// NEW: Function to configure button on Screen 2
+void configureDispenseButton() {
+    if(ui_Button1 && !buttonConfigured) {
+        Serial.println(">>> [UI] Configuring Dispense Button");
+        
+        // Remove any existing event handlers
+        lv_obj_remove_event_cb(ui_Button1, on_dispense_btn_event);
+        
+        // Make sure button is clickable
+        lv_obj_add_flag(ui_Button1, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_state(ui_Button1, LV_STATE_DISABLED);
+        lv_obj_move_foreground(ui_Button1);
+        
+        // Add fresh event callback
+        lv_obj_add_event_cb(ui_Button1, on_dispense_btn_event, LV_EVENT_CLICKED, NULL);
+        
+        // Fix the label inside the button
+        if(ui_Label3) {
+            lv_obj_clear_flag(ui_Label3, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_flag(ui_Label3, LV_OBJ_FLAG_EVENT_BUBBLE);
+        }
+        
+        buttonConfigured = true;
+        Serial.println(">>> [UI] Button Configured Successfully");
     }
 }
 
@@ -220,12 +243,15 @@ void callback(char* topic, byte* payload, unsigned int length) {
     for (int i = 0; i < length; i++) {
         message += (char)payload[i];
     }
-    logStatus("MQTT Recv: " + message);
+    
+    Serial.println(">>> [MQTT] Message received: " + message);
+    logStatus("MQTT: Dispensing...");
 
     JsonDocument doc;
     DeserializationError error = deserializeJson(doc, message);
     if (error) {
         logStatus("MQTT JSON Error");
+        Serial.println("JSON Error: " + String(error.c_str()));
         return;
     }
 
@@ -235,10 +261,15 @@ void callback(char* topic, byte* payload, unsigned int length) {
         currentPatientName = String((const char*)doc["patientName"]);
         currentMedication = String((const char*)doc["medicationName"]);
         
-        // 1. Start Alarm
+        Serial.println(">>> [MQTT] Dispense command parsed:");
+        Serial.println("    Slot: " + currentSlot);
+        Serial.println("    Patient: " + currentPatientName);
+        Serial.println("    Medication: " + currentMedication);
+        
+        // 1. Start Alarm immediately
         sendAlarmStart();
         
-        // 2. Trigger UI Update (switches screen in loop)
+        // 2. Trigger UI Update
         uiNeedsUpdate = true;
         
     } else if (command != NULL && String(command) == "ALARM_START") {
@@ -249,17 +280,17 @@ void callback(char* topic, byte* payload, unsigned int length) {
 }
 
 void reconnect() {
-    // Only try to reconnect if not connected
     if (!client.connected()) {
+        Serial.print(">>> [MQTT] Connecting... ");
         logStatus("MQTT Connecting...");
+        
         if (client.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD)) { 
-            logStatus("MQTT Connected!");
+            Serial.println("Connected!");
+            logStatus("MQTT Connected | Ready");
             client.subscribe(MQTT_TOPIC);
-            // Force status update to screen
-            lv_label_set_text(ui_uiserialLabel, "MQTT Connected | Ready");
+            Serial.println(">>> [MQTT] Subscribed to: " + String(MQTT_TOPIC));
         } else {
-            // Short log to avoid clutter
-            Serial.print("MQTT fail rc=");
+            Serial.print("Failed, rc=");
             Serial.println(client.state());
         }
     }
@@ -288,22 +319,29 @@ void my_touchpad_read(lv_indev_t *indev_drv, lv_indev_data_t *data) {
 void setup() {
     Serial.begin(115200);
     delay(1000);
+    Serial.println("\n\n=================================");
     Serial.println("PillPal Kiosk Starting...");
+    Serial.println("=================================\n");
 
     // 1. Init Display
+    Serial.println(">>> Initializing Display...");
     if (!gfx->begin()) { 
-        Serial.println("Display Init Failed!");
+        Serial.println("!!! Display Init Failed!");
         while(1);
     }
     pinMode(GFX_BL, OUTPUT); 
     digitalWrite(GFX_BL, HIGH);
     gfx->fillScreen(RGB565_BLACK);
+    Serial.println(">>> Display OK");
     
     // 2. Init Touch
+    Serial.println(">>> Initializing Touch...");
     touchController.begin();
     touchController.setRotation(ROTATION_INVERTED);
+    Serial.println(">>> Touch OK");
     
     // 3. Init LVGL
+    Serial.println(">>> Initializing LVGL...");
     lv_init();
     screenWidth = gfx->width();
     screenHeight = gfx->height();
@@ -318,12 +356,15 @@ void setup() {
     indev = lv_indev_create();
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, my_touchpad_read);
+    Serial.println(">>> LVGL OK");
     
     // 4. Init UI
-    Serial.println("Initializing UI...");
-    ui_init(); // This loads Screen 1 automatically
+    Serial.println(">>> Initializing UI Screens...");
+    ui_init();
+    Serial.println(">>> UI OK - Screen 1 Loaded");
     
     // 5. Connect to WiFi
+    Serial.println("\n>>> Connecting to WiFi...");
     logStatus("Connecting WiFi...");
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -331,95 +372,106 @@ void setup() {
     int wifi_attempts = 0;
     while (WiFi.status() != WL_CONNECTED && wifi_attempts < 20) {
         delay(500);
+        Serial.print(".");
         wifi_attempts++;
         lv_timer_handler(); 
     }
+    Serial.println();
     
     if (WiFi.status() == WL_CONNECTED) {
-        logStatus("WiFi Connected: " + WiFi.localIP().toString());
+        Serial.println(">>> WiFi Connected!");
+        Serial.println(">>> IP: " + WiFi.localIP().toString());
+        logStatus("WiFi: " + WiFi.localIP().toString());
         
         // 6. Init Time (NTP)
+        Serial.println(">>> Syncing time with NTP...");
         configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-        logStatus("Time Synced");
+        delay(2000); // Wait for time sync
+        printLocalTime();
+        Serial.println(">>> Time Synced");
         
         // 7. Init MQTT
+        Serial.println(">>> Configuring MQTT...");
         espClient.setInsecure();
         client.setServer(MQTT_SERVER, MQTT_PORT);
         client.setCallback(callback);
-        reconnect(); // Attempt initial connection
+        client.setBufferSize(512);  // Increase buffer for JSON
+        reconnect();
         
     } else {
-        logStatus("WiFi Failed! Check Creds");
+        Serial.println("!!! WiFi Connection Failed!");
+        logStatus("WiFi Failed!");
     }
     
     // 8. Init BLE
+    Serial.println(">>> Initializing BLE...");
     BLEDevice::init("PillPal-Kiosk");
     connectToBLEDispenser();
 
-    // 9. Configure Button Event (Fixing variable names here)
-    // NOTE: In ui_Screen2.c, the button is named ui_Button1, NOT ui_dispenseBtn
-    if(ui_Button1) {
-        logStatus("Configuring Button...");
-        
-        // Ensure button is clickable
-        lv_obj_add_flag(ui_Button1, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_clear_state(ui_Button1, LV_STATE_DISABLED);
-        lv_obj_move_foreground(ui_Button1);
-        
-        // Add event callback
-        lv_obj_add_event_cb(ui_Button1, on_dispense_btn_event, LV_EVENT_ALL, NULL);
-        
-        // Fix the label inside the button so it doesn't block touch
-        // In ui_Screen2.c, the label inside the button is ui_Label3
-        if(ui_Label3) {
-            lv_obj_clear_flag(ui_Label3, LV_OBJ_FLAG_CLICKABLE);
-            lv_obj_add_flag(ui_Label3, LV_OBJ_FLAG_IGNORE_LAYOUT);
-        }
-        logStatus("System Ready");
-    } else {
-        logStatus("ERROR: Button Not Found");
-    }
+    Serial.println("\n=================================");
+    Serial.println("System Ready!");
+    Serial.println("Waiting for dispense commands...");
+    Serial.println("=================================\n");
+    logStatus("System Ready");
 }
 
 // ==================== LOOP ====================
 void loop() {
-    lv_timer_handler(); // Must be called frequently
+    lv_timer_handler();
     
     // MQTT Loop
     if (!client.connected() && WiFi.status() == WL_CONNECTED) {
-        reconnect();
+        static unsigned long lastReconnect = 0;
+        if (millis() - lastReconnect > 5000) {
+            reconnect();
+            lastReconnect = millis();
+        }
     }
     client.loop();
 
     // Update Time (Every 1 second)
     static unsigned long lastTimeCheck = 0;
     if (millis() - lastTimeCheck > 1000) {
-        printLocalTime();
+        if(lv_scr_act() == ui_Screen1) {
+            printLocalTime();
+        }
         lastTimeCheck = millis();
     }
 
-    // BLE Maintenance
-    static unsigned long lastBLECheck = 0;
-    if (millis() - lastBLECheck > 5000) { 
-        if (!bleConnected) {
-            // Only try to reconnect if not busy dispensing
-            // connectToBLEDispenser(); // Optional: Auto-reconnect
-        }
-        lastBLECheck = millis();
-    }
-
-    // Switch to Screen 2 when MQTT "DISPENSE" received
+    // Handle Screen Switch to Screen 2
     if (uiNeedsUpdate) {
-        logStatus("Dispense Req: " + currentPatientName);
+        Serial.println("\n>>> [UI] Switching to Screen 2");
+        Serial.println("    Patient: " + currentPatientName);
+        Serial.println("    Medication: " + currentMedication);
+        Serial.println("    Slot: " + currentSlot);
         
-        if(ui_patientName) lv_label_set_text(ui_patientName, currentPatientName.c_str());
-        if(ui_medication) lv_label_set_text(ui_medication, currentMedication.c_str());
-        if(ui_slot) lv_label_set_text(ui_slot, currentSlot.c_str());
+        // Update labels BEFORE switching screen
+        if(ui_patientName) {
+            lv_label_set_text(ui_patientName, currentPatientName.c_str());
+            Serial.println(">>> [UI] Patient label updated");
+        }
+        if(ui_medication) {
+            lv_label_set_text(ui_medication, currentMedication.c_str());
+            Serial.println(">>> [UI] Medication label updated");
+        }
+        if(ui_slot) {
+            lv_label_set_text(ui_slot, currentSlot.c_str());
+            Serial.println(">>> [UI] Slot label updated");
+        }
         
         // SWITCH TO SCREEN 2
         lv_scr_load(ui_Screen2);
+        Serial.println(">>> [UI] Screen 2 loaded");
+        
+        // Force LVGL update
+        lv_refr_now(disp);
+        
+        // Configure button AFTER screen switch
+        delay(50); // Small delay to ensure screen is fully loaded
+        configureDispenseButton();
         
         uiNeedsUpdate = false;
+        Serial.println(">>> [UI] Ready for button press\n");
     }
 
     delay(5); 
